@@ -1,10 +1,11 @@
 from __future__ import annotations
+import pprint
 from typing import Callable, List, Tuple, Dict, cast, Union, Optional, TypeVar, Generic
 import functools, itertools, operator
 from tinygrad.nn.state import get_parameters
 from tinygrad.dtype import DType
 from tinygrad.helpers import DEBUG, merge_dicts, getenv, all_int, Context, GRAPH, flatten, GraphException
-from tinygrad.device import Compiled, JITRunner, CompiledASTRunner, Buffer
+from tinygrad.device import BufferCopy, Compiled, JITRunner, CompiledASTRunner, Buffer, Device
 from tinygrad.tensor import Tensor
 from tinygrad.lazy import LazyBuffer
 from tinygrad.features.multi import MultiLazyBuffer
@@ -12,6 +13,7 @@ from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.symbolic import Variable, sint
 from weakref import ref, WeakKeyDictionary
 from dataclasses import dataclass
+import pickle
 
 @dataclass(frozen=True)
 class JitItem:
@@ -74,11 +76,30 @@ def apply_graph_to_jit(jit_cache: List[JitItem], input_rawbuffers: List[Buffer],
 
 # *** JIT ***
 
+@dataclass(frozen=True)
+class SerializedTensor:
+  device: str
+  shape: Tuple[int, ...]
+  dtype: DType
+  replace: Dict[Tuple[int, int], int]
+
+GLOBAL_CACHE = True
+
 ReturnType = TypeVar('ReturnType')
 class TinyJit(Generic[ReturnType]):
   def __init__(self, fxn:Callable[..., ReturnType]):
     self.fxn = fxn
     self.reset()
+    if GLOBAL_CACHE:
+      import inspect
+      import os
+      line = inspect.getsourcelines(self.fxn)[1]
+      file = inspect.getsourcefile(self.fxn)
+      filename = f"{file}_{line}.pkl"
+      path = os.path.join("/tmp/tinygrad_jitcache", filename)
+      if os.path.exists(path):
+        self.load(path)
+
 
   def reset(self):
     self.jit_cache: List[JitItem] = []
@@ -130,6 +151,16 @@ class TinyJit(Generic[ReturnType]):
       if getenv("JIT") != 2: self.jit_cache = apply_graph_to_jit(self.jit_cache, input_rawbuffers, var_vals)
 
       self.input_replace = get_input_replace(self.jit_cache, input_rawbuffers)
+
+      if GLOBAL_CACHE:
+        import inspect
+        import os
+        line = inspect.getsourcelines(self.fxn)[1]
+        file = inspect.getsourcefile(self.fxn)
+        filename = f"{file}_{line}.pkl"
+        path = os.path.join("/tmp/tinygrad_jitcache", filename)
+        self.save(path)
+
     elif self.cnt == 0:
       # jit ignore
       self.ret = self.fxn(*args, **kwargs)
@@ -140,6 +171,136 @@ class TinyJit(Generic[ReturnType]):
 
     self.cnt += 1
     return cast(ReturnType, self.ret)
+  
+  def load(self, path:str):
+    self.reset()
+    with open(path, "rb") as f: 
+      sjc, self.input_replace, self.expected_vals, self.expected_name_sts_dtype_device, ret = pickle.load(f)
+
+      for prg, bufs in sjc:
+        # Deserialize prog
+        if isinstance(prg, tuple):
+          name, src, lib, device, gs, ls = prg
+          prg = CompiledASTRunner(None, name, src, Device[device], gs, ls, lib)
+        elif isinstance(prg, BufferCopy):
+          continue
+        else:
+          raise NotImplementedError()
+        
+        rawbufs = []
+        for b in bufs:
+          if b is not None:
+            r = Buffer(b[0], b[1], b[2], options=b[3])
+            rawbufs.append(r)
+          else:
+            rawbufs.append(None)
+          
+        self.jit_cache.append(JitItem(prg, rawbufs))
+      
+      # Deserialize ret
+      # TODO: maybe can abstract this into some kind of 'transform' helper, that just applies a transformation on the child types
+      def deserialize(obj):
+        if isinstance(obj, list):
+          return tuple(deserialize(x) for x in obj)
+        if isinstance(obj, tuple):
+          return [deserialize(x) for x in obj]
+        elif isinstance(obj, dict):
+          return {k: deserialize(v) for k,v in obj.items()}
+        elif isinstance(obj, SerializedTensor):
+          lbs = []
+          for (j, i) in obj.replace:
+            raw = self.jit_cache[j].rawbufs[i]
+            lb = LazyBuffer(obj.device, ShapeTracker.from_shape(obj.shape), obj.dtype)
+            lb.realized = raw
+            lbs.append(lb)
+
+          # TODO: fix multi
+          assert len(lbs) == 1 
+          lazydata = lbs[0] # if len(lbs) == 1 else MultiLazyBuffer(lbs, obj.axis, obj.real)
+          return Tensor(lazydata, obj.device)
+        else:
+          raise TypeError(f"Invalid return type for the jit {type(obj)}")
+
+      self.ret = deserialize(ret)
+      # pprint.pprint(self.jit_cache)
+      # pprint.pprint(sjc)
+      
+    self.cnt = 2
+    
+  def save(self, path:str):
+    if self.jit_cache is None:
+      raise RuntimeError("Cache must be initialized before saving")
+    
+    sjc = []
+    for j, ji in enumerate(self.jit_cache):
+      # Serialize prog
+      # TODO: handle graph
+      if isinstance(p := ji.prg, CompiledASTRunner):
+        sji = (p.display_name, p.prg, p.lib, p.device.dname, p.global_size, p.local_size)
+      elif isinstance(ji.prg, BufferCopy):
+        sji = ji
+      else:
+        raise NotImplementedError(f"{ji.prg}")
+
+      # Serialize bufs 
+      # TODO: maybe move this to new load/save methods inside Buffer?
+      bufs = []
+      for i, b in enumerate(ji.rawbufs):
+        if (j, i) in self.input_replace:
+          # assert b is None, b
+          # continue
+          pass
+        if b is not None:
+          assert not b.is_opaque, "Opaque buffer cannot be serialized"
+          sb = (b.device, b.size, b.dtype, b.options)
+        else:
+          sb = None
+        bufs.append(sb)
+
+      sjc.append((sji, bufs))
+
+    # Ret
+    def serialize(obj):
+      if isinstance(obj, list):
+        return tuple(serialize(x) for x in obj)
+      if isinstance(obj, tuple):
+        return [serialize(x) for x in obj]
+      elif isinstance(obj, dict):
+        return {k: serialize(v) for k,v in obj.items()}
+      elif isinstance(obj, Tensor):
+        lbs: List[LazyBuffer]
+        if isinstance(obj.lazydata, LazyBuffer):
+          lbs = [obj.lazydata] 
+        elif isinstance(obj.lazydata, MultiLazyBuffer):
+          lbs = obj.lazydata.lbs
+        else:
+          assert False
+        
+        rawbuffers: List[Buffer] = [v.base.realized for v in lbs if v.base.realized is not None]
+        replace: List[Tuple[int, int]] = []
+        for j,ji in enumerate(self.jit_cache):
+          for i,a in enumerate(ji.rawbufs):
+            if a in rawbuffers:
+              replace.append((j, i))
+        return SerializedTensor(device=obj.device, shape=obj.shape, dtype=obj.dtype, replace=replace)
+      else:
+        raise TypeError(f"Invalid return type for the jit {type(obj)}")
+
+    ret = serialize(self.ret)
+
+    # pprint.pprint(self.jit_cache)
+    # pprint.pprint(sjc)
+    # pprint.pprint(self.ret)
+
+    with open(path, "wb") as f: 
+      pickle.dump((
+        sjc,
+        self.input_replace, 
+        self.expected_vals, 
+        self.expected_name_sts_dtype_device,
+        ret,
+      ), f)
+
 
 class PlaceHolder:
   def __init__(self, buf:Buffer):

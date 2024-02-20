@@ -104,7 +104,7 @@ class TestJit(unittest.TestCase):
       b = Tensor.randn(10, 10)
       a.realize(), b.realize()
       c = add_array(a, [b])
-      if i >= 2:
+      if add_array.cnt >= 3:
         # should fail once jitted since jit can't handle arrays
         np.testing.assert_allclose(np.any(np.not_equal(c.numpy(),a.numpy()+b.numpy())), True, atol=1e-4, rtol=1e-5)
       else:
